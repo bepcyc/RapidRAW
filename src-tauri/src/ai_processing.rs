@@ -13,9 +13,7 @@ use image::{
 };
 use ndarray::{Array, Array4, ArrayViewD, IxDyn, s};
 use ort::editor::{Graph, Model, Node, ONNX_DOMAIN, Opset, Outlet};
-use ort::execution_providers::{
-    CPUExecutionProvider, ExecutionProvider, ExecutionProviderDispatch,
-};
+use ort::execution_providers::{CPUExecutionProvider, ExecutionProvider};
 use ort::memory::Allocator;
 use ort::session::{Output, Session};
 use ort::tensor::{Shape, SymbolicDimensions, TensorElementType};
@@ -499,50 +497,120 @@ fn high_performance_dml_device_id() -> Option<i32> {
     }
 }
 
+type GpuProvider = Arc<dyn ExecutionProvider>;
+
 #[cfg(target_os = "windows")]
-fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
-    Some(
+fn gpu_execution_provider() -> Option<GpuProvider> {
+    Some(Arc::new(
         ort::execution_providers::DirectMLExecutionProvider::default()
-            .with_device_id(high_performance_dml_device_id().unwrap_or(0))
-            .build()
-            .error_on_failure(),
-    )
+            .with_device_id(high_performance_dml_device_id().unwrap_or(0)),
+    ))
 }
 
 #[cfg(target_os = "macos")]
-fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
+fn gpu_execution_provider() -> Option<GpuProvider> {
     use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLModelFormat};
 
-    Some(
+    Some(Arc::new(
         ort::execution_providers::CoreMLExecutionProvider::default()
             .with_model_format(CoreMLModelFormat::MLProgram)
-            .with_compute_units(CoreMLComputeUnits::All)
-            .build()
-            .error_on_failure(),
-    )
+            .with_compute_units(CoreMLComputeUnits::All),
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
+mod migraphx_ep {
+    use core::ffi::{c_char, c_int};
+    use core::ptr;
+
+    use ort::execution_providers::{ExecutionProvider, RegisterError};
+    use ort::session::builder::SessionBuilder;
+    use ort::AsPointer;
+
+    // ort-sys 2.0.0-rc.10's OrtMIGraphXProviderOptions predates the migraphx_fp8_enable,
+    // migraphx_mem_limit and migraphx_arena_extend_strategy fields present in the C struct of
+    // every ORT build that ships a working MIGraphX EP (>= 1.20, verified against the 1.23.2
+    // header). Registering through the short struct makes the C side read stack garbage in the
+    // tail (observed: arena_extend_strategy=256 -> EnumToName FAIL). We register with the full
+    // 1.23.2 layout ourselves instead.
+    #[repr(C)]
+    struct MIGraphXProviderOptions {
+        device_id: c_int,
+        migraphx_fp16_enable: c_int,
+        migraphx_fp8_enable: c_int,
+        migraphx_int8_enable: c_int,
+        migraphx_use_native_calibration_table: c_int,
+        migraphx_int8_calibration_table_name: *const c_char,
+        migraphx_save_compiled_model: c_int,
+        migraphx_save_model_path: *const c_char,
+        migraphx_load_compiled_model: c_int,
+        migraphx_load_model_path: *const c_char,
+        migraphx_exhaustive_tune: bool,
+        migraphx_mem_limit: usize,
+        migraphx_arena_extend_strategy: c_int,
+    }
+
+    pub struct MIGraphX {
+        device_id: c_int,
+        fp16: bool,
+    }
+
+    impl MIGraphX {
+        pub fn new(device_id: c_int, fp16: bool) -> Self {
+            Self { device_id, fp16 }
+        }
+    }
+
+    impl ExecutionProvider for MIGraphX {
+        fn name(&self) -> &'static str {
+            "MIGraphXExecutionProvider"
+        }
+
+        fn supported_by_platform(&self) -> bool {
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        }
+
+        fn register(&self, session_builder: &mut SessionBuilder) -> Result<(), RegisterError> {
+            let options = MIGraphXProviderOptions {
+                device_id: self.device_id,
+                migraphx_fp16_enable: self.fp16.into(),
+                migraphx_fp8_enable: 0,
+                migraphx_int8_enable: 0,
+                migraphx_use_native_calibration_table: 0,
+                migraphx_int8_calibration_table_name: ptr::null(),
+                migraphx_save_compiled_model: 0,
+                migraphx_save_model_path: ptr::null(),
+                migraphx_load_compiled_model: 0,
+                migraphx_load_model_path: ptr::null(),
+                migraphx_exhaustive_tune: false,
+                migraphx_mem_limit: usize::MAX,
+                migraphx_arena_extend_strategy: 0,
+            };
+            let status = unsafe {
+                (ort::api().SessionOptionsAppendExecutionProvider_MIGraphX)(
+                    session_builder.ptr_mut(),
+                    &options as *const _ as *const ort::sys::OrtMIGraphXProviderOptions,
+                )
+            };
+            unsafe { ort::error::status_to_result(status) }.map_err(RegisterError::from)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gpu_execution_provider() -> Option<GpuProvider> {
     // MIGraphX EP (AMD GPUs via ROCm). It is a provider-bridge EP: the loaded libonnxruntime must ship
     // libonnxruntime_providers_migraphx.so plus the ROCm runtime (AMD's onnxruntime_migraphx builds).
     // On stock CPU-only runtimes is_available() fails -> None, so nothing changes for machines without the stack.
-    if !ort::execution_providers::MIGraphXExecutionProvider::default()
-        .is_available()
-        .ok()?
-    {
+    let provider = migraphx_ep::MIGraphX::new(0, true);
+    if !provider.is_available().ok()? {
         return None;
     }
-    Some(
-        ort::execution_providers::MIGraphXExecutionProvider::default()
-            .with_device_id(0)
-            .build()
-            .error_on_failure(),
-    )
+    Some(Arc::new(provider))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
+fn gpu_execution_provider() -> Option<GpuProvider> {
     None
 }
 
@@ -593,23 +661,24 @@ fn denoise_crop_as_slice() -> ort::Result<(Model, Vec<Output>)> {
 fn create_session(
     model_path: &Path,
     kind: SessionKind,
-    gpu_provider: Option<ExecutionProviderDispatch>,
+    gpu_provider: Option<GpuProvider>,
     gpu_patch: Option<GpuModelPatch>,
 ) -> Result<Session> {
-    let use_gpu = gpu_provider.is_some();
     let cpu_provider = CPUExecutionProvider::default()
         .with_arena_allocator(kind == SessionKind::Persistent)
         .build();
-    let providers: Vec<_> = gpu_provider.into_iter().chain([cpu_provider]).collect();
 
     let mut builder = Session::builder()?;
-    if use_gpu || kind == SessionKind::OneShot {
+    if gpu_provider.is_some() || kind == SessionKind::OneShot {
         builder = builder.with_memory_pattern(false)?;
     }
-    if use_gpu && kind == SessionKind::OneShot {
+    if gpu_provider.is_some() && kind == SessionKind::OneShot {
         builder = builder.with_config_entry("ep.dml.disable_memory_arena", "1")?;
     }
-    let builder = builder.with_execution_providers(providers)?;
+    if let Some(provider) = gpu_provider {
+        provider.register(&mut builder).map_err(ort::Error::from)?;
+    }
+    let builder = builder.with_execution_providers([cpu_provider])?;
     match gpu_patch {
         Some(patch) => {
             let (model, outputs) = patch()?;
