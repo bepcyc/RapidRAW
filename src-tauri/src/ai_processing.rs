@@ -13,7 +13,9 @@ use image::{
 };
 use ndarray::{Array, Array4, ArrayViewD, IxDyn, s};
 use ort::editor::{Graph, Model, Node, ONNX_DOMAIN, Opset, Outlet};
-use ort::execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch};
+use ort::execution_providers::{
+    CPUExecutionProvider, ExecutionProvider, ExecutionProviderDispatch,
+};
 use ort::memory::Allocator;
 use ort::session::{Output, Session};
 use ort::tensor::{Shape, SymbolicDimensions, TensorElementType};
@@ -520,7 +522,26 @@ fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
     )
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
+    // MIGraphX EP (AMD GPUs via ROCm). It is a provider-bridge EP: the loaded libonnxruntime must ship
+    // libonnxruntime_providers_migraphx.so plus the ROCm runtime (AMD's onnxruntime_migraphx builds).
+    // On stock CPU-only runtimes is_available() fails -> None, so nothing changes for machines without the stack.
+    if !ort::execution_providers::MIGraphXExecutionProvider::default()
+        .is_available()
+        .ok()?
+    {
+        return None;
+    }
+    Some(
+        ort::execution_providers::MIGraphXExecutionProvider::default()
+            .with_device_id(0)
+            .build()
+            .error_on_failure(),
+    )
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn gpu_execution_provider() -> Option<ExecutionProviderDispatch> {
     None
 }
