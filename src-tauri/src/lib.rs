@@ -2524,8 +2524,12 @@ pub fn run() {
                         { "libonnxruntime.so" }
                     };
                     let ort_library_path = resource_path.join(ort_library_name);
-                    std::env::set_var("ORT_DYLIB_PATH", &ort_library_path);
-                    cli_println!("Set ORT_DYLIB_PATH to: {}", ort_library_path.display());
+                    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+                        std::env::set_var("ORT_DYLIB_PATH", &ort_library_path);
+                        cli_println!("Set ORT_DYLIB_PATH to: {}", ort_library_path.display());
+                    } else {
+                        cli_println!("Using ORT_DYLIB_PATH from environment");
+                    }
                 }
             }
 
