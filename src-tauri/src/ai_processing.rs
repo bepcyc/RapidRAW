@@ -567,7 +567,7 @@ mod migraphx_ep {
         }
 
         fn supported_by_platform(&self) -> bool {
-            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            cfg!(target_arch = "x86_64")
         }
 
         fn register(&self, session_builder: &mut SessionBuilder) -> Result<(), RegisterError> {
@@ -586,6 +586,9 @@ mod migraphx_ep {
                 migraphx_mem_limit: usize::MAX,
                 migraphx_arena_extend_strategy: 0,
             };
+            // SAFETY: MIGraphXProviderOptions is layout-identical to OrtMIGraphXProviderOptions of
+            // ORT >= 1.20 (verified field-for-field against onnxruntime_c_api.h 1.23.x). All fields
+            // are initialized, `options` outlives the call, and ORT copies the values it needs.
             let status = unsafe {
                 (ort::api().SessionOptionsAppendExecutionProvider_MIGraphX)(
                     session_builder.ptr_mut(),
@@ -602,6 +605,11 @@ fn gpu_execution_provider() -> Option<GpuProvider> {
     // MIGraphX EP (AMD GPUs via ROCm). It is a provider-bridge EP: the loaded libonnxruntime must ship
     // libonnxruntime_providers_migraphx.so plus the ROCm runtime (AMD's onnxruntime_migraphx builds).
     // On stock CPU-only runtimes is_available() fails -> None, so nothing changes for machines without the stack.
+    // device_id 0: no multi-GPU selection yet (the DirectML path enumerates adapters — a MIGraphX
+    // equivalent would need the HIP device count; TODO when multi-GPU is a real request).
+    // fp16=true: the primary shipped models are fp16 (birefnet_..._fp16, lama_fp16). The flag also
+    // quantizes fp32 models graph-wide (ESAM3, depth, CLIP, denoise) — a deliberate trade for the
+    // VRAM/bandwidth limits of consumer AMD cards; a per-model choice can come later if needed.
     let provider = migraphx_ep::MIGraphX::new(0, true);
     if !provider.is_available().ok()? {
         return None;
@@ -673,6 +681,7 @@ fn create_session(
         builder = builder.with_memory_pattern(false)?;
     }
     if gpu_provider.is_some() && kind == SessionKind::OneShot {
+        // DML-only workaround; the key is a valid ORT session option and is ignored by other EPs.
         builder = builder.with_config_entry("ep.dml.disable_memory_arena", "1")?;
     }
     if let Some(provider) = gpu_provider {
